@@ -16,7 +16,7 @@ package outbound
 //     host: cdn.example.com                      # HTTP Host header (disguise)
 //     path: /chat                                # HTTP path (disguise)
 //     skip-cert-verify: false
-//     client-fingerprint: chrome                 # (ignored for now; future uTLS hook)
+//     client-fingerprint: chrome                 # uTLS fingerprint: chrome|firefox|safari|ios|edge|random|...
 //     udp: false                                 # UDP not supported in v1
 
 import (
@@ -28,6 +28,7 @@ import (
 	"net"
 	"strconv"
 
+	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/aegis"
 )
@@ -67,9 +68,30 @@ func (a *Aegis) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		NextProtos:         []string{"http/1.1"},
 		InsecureSkipVerify: a.option.SkipCertVerify,
 	}
-	tlsConn := tls.Client(c, tlsCfg)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return nil, fmt.Errorf("aegis: tls handshake: %w", err)
+
+	// TLS with optional uTLS fingerprint. When client-fingerprint is set
+	// (e.g. "chrome", "firefox", "safari", "ios", "random"), use uTLS so
+	// the ClientHello mimics a real browser; otherwise fall back to the
+	// stdlib crypto/tls.
+	var tlsConn net.Conn
+	if fp, ok := tlsC.GetFingerprint(a.option.ClientFingerprint); ok {
+		uConn := tlsC.UClient(c, tlsC.UConfig(tlsCfg), fp)
+		// Pin the ALPN to http/1.1 inside the uTLS extensions so the
+		// Sec-WebSocket-Protocol carrier handshake we send next is
+		// consistent with what a real browser would advertise.
+		if err := tlsC.BuildWebsocketHandshakeState(uConn); err != nil {
+			return nil, fmt.Errorf("aegis: build utls handshake state: %w", err)
+		}
+		if err := uConn.HandshakeContext(ctx); err != nil {
+			return nil, fmt.Errorf("aegis: utls handshake: %w", err)
+		}
+		tlsConn = uConn
+	} else {
+		stdTLS := tls.Client(c, tlsCfg)
+		if err := stdTLS.HandshakeContext(ctx); err != nil {
+			return nil, fmt.Errorf("aegis: tls handshake: %w", err)
+		}
+		tlsConn = stdTLS
 	}
 
 	ephSk, _, err := aegis.GenerateEphemeralKeypair()
