@@ -195,6 +195,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewTailscale(*tailscaleOption)
+	case "aegis":
+		aegisOption := &outbound.AegisOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, aegisOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewAegis(*aegisOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
