@@ -43,6 +43,7 @@ const (
 	Tuic
 	Ssh
 	Mieru
+	Aegis
 )
 
 const (
@@ -229,6 +230,8 @@ func (at AdapterType) String() string {
 		return "Ssh"
 	case Mieru:
 		return "Mieru"
+	case Aegis:
+		return "Aegis"
 	case Relay:
 		return "Relay"
 	case Selector:
