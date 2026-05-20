@@ -29,11 +29,13 @@ import (
 type FrameType byte
 
 const (
-	FrameData       FrameType = 0x01
-	FrameKeepAlive  FrameType = 0x02
-	FrameClose      FrameType = 0x03
-	FrameConnect    FrameType = 0x04
-	FrameConnectAck FrameType = 0x05
+	FrameData         FrameType = 0x01
+	FrameKeepAlive    FrameType = 0x02
+	FrameClose        FrameType = 0x03
+	FrameConnect      FrameType = 0x04
+	FrameConnectAck   FrameType = 0x05
+	FrameUdpAssociate FrameType = 0x06 // empty payload; replaces FrameConnect for UDP-over-TCP
+	FrameUdpData      FrameType = 0x07 // [atyp:1][addr][port:2][udp_payload]
 )
 
 const (
@@ -230,4 +232,61 @@ func EncodeConnect(host string, port uint16) []byte {
 	binary.BigEndian.PutUint16(p[:], port)
 	out = append(out, p[:]...)
 	return out
+}
+
+// EncodeUdpData builds the payload of a FrameUdpData:
+//
+//	atyp(1) | addr | port(u16 BE) | udp_payload
+//
+// Same atyp encoding as EncodeConnect; trailing bytes are the raw UDP datagram.
+func EncodeUdpData(host string, port uint16, payload []byte) []byte {
+	header := EncodeConnect(host, port)
+	out := make([]byte, 0, len(header)+len(payload))
+	out = append(out, header...)
+	out = append(out, payload...)
+	return out
+}
+
+// DecodeUdpData parses a FrameUdpData payload back into (host, port, udp_payload).
+func DecodeUdpData(buf []byte) (string, uint16, []byte, error) {
+	if len(buf) < 1 {
+		return "", 0, nil, errors.New("aegis: empty UdpData payload")
+	}
+	atyp := buf[0]
+	var (
+		host    string
+		off     int
+	)
+	switch atyp {
+	case 1:
+		if len(buf) < 1+4+2 {
+			return "", 0, nil, errors.New("aegis: short v4 UdpData")
+		}
+		host = net.IP(buf[1:5]).String()
+		off = 1 + 4
+	case 3:
+		if len(buf) < 2 {
+			return "", 0, nil, errors.New("aegis: short domain UdpData")
+		}
+		n := int(buf[1])
+		if len(buf) < 2+n+2 {
+			return "", 0, nil, errors.New("aegis: short domain UdpData")
+		}
+		host = string(buf[2 : 2+n])
+		off = 2 + n
+	case 4:
+		if len(buf) < 1+16+2 {
+			return "", 0, nil, errors.New("aegis: short v6 UdpData")
+		}
+		host = net.IP(buf[1:17]).String()
+		off = 1 + 16
+	default:
+		return "", 0, nil, errors.New("aegis: bad atyp in UdpData")
+	}
+	if len(buf) < off+2 {
+		return "", 0, nil, errors.New("aegis: missing port in UdpData")
+	}
+	port := binary.BigEndian.Uint16(buf[off : off+2])
+	off += 2
+	return host, port, buf[off:], nil
 }

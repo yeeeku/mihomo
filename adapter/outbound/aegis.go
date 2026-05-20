@@ -17,7 +17,7 @@ package outbound
 //     path: /chat                                # HTTP path (disguise)
 //     skip-cert-verify: false
 //     client-fingerprint: chrome                 # uTLS fingerprint: chrome|firefox|safari|ios|edge|random|...
-//     udp: false                                 # UDP not supported in v1
+//     udp: true                                  # UDP-over-TCP via separate Aegis stream per UDP session
 
 import (
 	"context"
@@ -54,64 +54,18 @@ type AegisOption struct {
 	UDP               bool   `proxy:"udp,omitempty"`
 }
 
-// StreamConnContext implements C.ProxyAdapter -- wraps the raw dialed TCP
-// connection in TLS, runs the Aegis handshake, sends a Connect frame
-// targeting metadata's destination.
+// StreamConnContext implements C.ProxyAdapter -- TCP stream path.
+// Wraps the raw dialed TCP connection in TLS, runs the Aegis handshake,
+// sends a Connect frame for metadata's destination.
 func (a *Aegis) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (net.Conn, error) {
-	sni := a.option.SNI
-	if sni == "" {
-		sni = a.option.Server
-	}
-	tlsCfg := &tls.Config{
-		ServerName:         sni,
-		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{"http/1.1"},
-		InsecureSkipVerify: a.option.SkipCertVerify,
-	}
-
-	// TLS with optional uTLS fingerprint. When client-fingerprint is set
-	// (e.g. "chrome", "firefox", "safari", "ios", "random"), use uTLS so
-	// the ClientHello mimics a real browser; otherwise fall back to the
-	// stdlib crypto/tls.
-	var tlsConn net.Conn
-	if fp, ok := tlsC.GetFingerprint(a.option.ClientFingerprint); ok {
-		uConn := tlsC.UClient(c, tlsC.UConfig(tlsCfg), fp)
-		// Pin the ALPN to http/1.1 inside the uTLS extensions so the
-		// Sec-WebSocket-Protocol carrier handshake we send next is
-		// consistent with what a real browser would advertise.
-		if err := tlsC.BuildWebsocketHandshakeState(uConn); err != nil {
-			return nil, fmt.Errorf("aegis: build utls handshake state: %w", err)
-		}
-		if err := uConn.HandshakeContext(ctx); err != nil {
-			return nil, fmt.Errorf("aegis: utls handshake: %w", err)
-		}
-		tlsConn = uConn
-	} else {
-		stdTLS := tls.Client(c, tlsCfg)
-		if err := stdTLS.HandshakeContext(ctx); err != nil {
-			return nil, fmt.Errorf("aegis: tls handshake: %w", err)
-		}
-		tlsConn = stdTLS
-	}
-
-	ephSk, _, err := aegis.GenerateEphemeralKeypair()
+	tlsConn, err := a.handshakeTLS(ctx, c)
 	if err != nil {
-		return nil, fmt.Errorf("aegis: gen ephemeral: %w", err)
+		return nil, err
 	}
-	host := a.option.Host
-	if host == "" {
-		host = sni
-	}
-	path := a.option.Path
-	if path == "" {
-		path = "/"
-	}
-	cfg := aegis.ClientConfig{
-		EphSk:      ephSk,
-		ServerPub:  a.serverPub,
-		UserSecret: aegis.DeriveUserSecret(a.option.Password),
-		Host:       host,
-		Path:       path,
+
+	cfg, err := a.buildAegisClientConfig()
+	if err != nil {
+		return nil, err
 	}
 
 	targetHost, targetPort, err := metadataAddr(metadata)
@@ -124,6 +78,65 @@ func (a *Aegis) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		return nil, err
 	}
 	return ac, nil
+}
+
+// handshakeTLS wraps `c` in TLS (optionally uTLS). Used by both the TCP
+// (StreamConnContext) and UDP (ListenPacketContext) paths so they share
+// the same fingerprint masquerade.
+func (a *Aegis) handshakeTLS(ctx context.Context, c net.Conn) (net.Conn, error) {
+	sni := a.option.SNI
+	if sni == "" {
+		sni = a.option.Server
+	}
+	tlsCfg := &tls.Config{
+		ServerName:         sni,
+		MinVersion:         tls.VersionTLS13,
+		NextProtos:         []string{"http/1.1"},
+		InsecureSkipVerify: a.option.SkipCertVerify,
+	}
+
+	if fp, ok := tlsC.GetFingerprint(a.option.ClientFingerprint); ok {
+		uConn := tlsC.UClient(c, tlsC.UConfig(tlsCfg), fp)
+		if err := tlsC.BuildWebsocketHandshakeState(uConn); err != nil {
+			return nil, fmt.Errorf("aegis: build utls handshake state: %w", err)
+		}
+		if err := uConn.HandshakeContext(ctx); err != nil {
+			return nil, fmt.Errorf("aegis: utls handshake: %w", err)
+		}
+		return uConn, nil
+	}
+	stdTLS := tls.Client(c, tlsCfg)
+	if err := stdTLS.HandshakeContext(ctx); err != nil {
+		return nil, fmt.Errorf("aegis: tls handshake: %w", err)
+	}
+	return stdTLS, nil
+}
+
+// buildAegisClientConfig generates a fresh ephemeral keypair and bundles
+// it with the static per-node config into an aegis.ClientConfig.
+func (a *Aegis) buildAegisClientConfig() (aegis.ClientConfig, error) {
+	ephSk, _, err := aegis.GenerateEphemeralKeypair()
+	if err != nil {
+		return aegis.ClientConfig{}, fmt.Errorf("aegis: gen ephemeral: %w", err)
+	}
+	host := a.option.Host
+	if host == "" {
+		host = a.option.SNI
+		if host == "" {
+			host = a.option.Server
+		}
+	}
+	path := a.option.Path
+	if path == "" {
+		path = "/"
+	}
+	return aegis.ClientConfig{
+		EphSk:      ephSk,
+		ServerPub:  a.serverPub,
+		UserSecret: aegis.DeriveUserSecret(a.option.Password),
+		Host:       host,
+		Path:       path,
+	}, nil
 }
 
 // DialContext implements C.ProxyAdapter.
@@ -143,13 +156,38 @@ func (a *Aegis) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 	return NewConn(streamed, a), nil
 }
 
-// ListenPacketContext: UDP not supported in v1.
+// ListenPacketContext implements C.ProxyAdapter: UDP-over-TCP tunnel.
+// Opens a fresh TCP + TLS + Aegis handshake, sends a UdpAssociate frame
+// (instead of Connect), then returns a net.PacketConn that wraps every
+// Write/Read in a FrameUdpData carrying (host, port, payload).
 func (a *Aegis) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	return nil, errors.New("aegis: UDP not supported (v1)")
+	c, err := a.dialer.DialContext(ctx, "tcp", a.addr)
+	if err != nil {
+		return nil, fmt.Errorf("aegis udp dial %s: %w", a.addr, err)
+	}
+
+	tlsConn, err := a.handshakeTLS(ctx, c)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	cfg, err := a.buildAegisClientConfig()
+	if err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+
+	pc, err := aegis.OpenUDP(tlsConn, cfg)
+	if err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+	return newPacketConn(pc, a), nil
 }
 
-// SupportUOT implements C.ProxyAdapter (no UDP-over-TCP for now).
-func (a *Aegis) SupportUOT() bool { return false }
+// SupportUOT implements C.ProxyAdapter -- yes, UDP rides UoT frames.
+func (a *Aegis) SupportUOT() bool { return true }
 
 // ProxyInfo implements C.ProxyAdapter.
 func (a *Aegis) ProxyInfo() C.ProxyInfo {
