@@ -21,7 +21,6 @@ package outbound
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -32,6 +31,7 @@ import (
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/aegis"
+	"github.com/metacubex/tls"
 )
 
 type Aegis struct {

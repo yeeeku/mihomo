@@ -22,8 +22,8 @@ import (
 	mathrand "math/rand"
 	"net"
 
+	"github.com/metacubex/blake3"
 	"golang.org/x/crypto/chacha20poly1305"
-	"lukechampine.com/blake3"
 )
 
 type FrameType byte

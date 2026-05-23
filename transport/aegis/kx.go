@@ -20,8 +20,8 @@ import (
 	"encoding/binary"
 	"errors"
 
+	"github.com/metacubex/blake3"
 	"golang.org/x/crypto/curve25519"
-	"lukechampine.com/blake3"
 )
 
 // BlobLen is the on-wire handshake blob:
