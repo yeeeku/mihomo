@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
@@ -37,6 +38,10 @@ type Aegis struct {
 	*Base
 	option    *AegisOption
 	serverPub [32]byte
+
+	// muxPool is lazily created on first dial when option.Mux=true.
+	muxPoolOnce sync.Once
+	muxPool     *aegis.MuxPool
 }
 
 type AegisOption struct {
@@ -52,6 +57,11 @@ type AegisOption struct {
 	SkipCertVerify    bool   `proxy:"skip-cert-verify,omitempty"`
 	ClientFingerprint string `proxy:"client-fingerprint,omitempty"`
 	UDP               bool   `proxy:"udp,omitempty"`
+	// Mux enables v2 multiplexing: many streams share a few long-lived
+	// TLS conns. Big GFW/傲盾 evasion win because connection-count is no
+	// longer a tell. v1 servers don't support mux -- nodes that haven't
+	// been upgraded to v1.19.25-aegis-mux must keep mux=false.
+	Mux bool `proxy:"mux,omitempty"`
 }
 
 // StreamConnContext implements C.ProxyAdapter -- TCP stream path.
@@ -140,7 +150,25 @@ func (a *Aegis) buildAegisClientConfig() (aegis.ClientConfig, error) {
 }
 
 // DialContext implements C.ProxyAdapter.
+//   Mux on  -> get a MuxConn from the pool, OpenStream there.
+//   Mux off -> one TLS+Aegis conn per stream (v1 behaviour).
 func (a *Aegis) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if a.option.Mux {
+		mc, err := a.getMuxPool().GetConn()
+		if err != nil {
+			return nil, fmt.Errorf("aegis mux: get conn: %w", err)
+		}
+		targetHost, targetPort, err := metadataAddr(metadata)
+		if err != nil {
+			return nil, err
+		}
+		s, err := mc.OpenStream(targetHost, targetPort)
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(s, a), nil
+	}
+
 	c, err := a.dialer.DialContext(ctx, "tcp", a.addr)
 	if err != nil {
 		return nil, fmt.Errorf("aegis dial %s: %w", a.addr, err)
@@ -157,10 +185,21 @@ func (a *Aegis) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 }
 
 // ListenPacketContext implements C.ProxyAdapter: UDP-over-TCP tunnel.
-// Opens a fresh TCP + TLS + Aegis handshake, sends a UdpAssociate frame
-// (instead of Connect), then returns a net.PacketConn that wraps every
-// Write/Read in a FrameUdpData carrying (host, port, payload).
+//   Mux on  -> mux stream of type OpenUdp on a pooled MuxConn.
+//   Mux off -> one TLS+Aegis conn per UDP session (v1 UoT path).
 func (a *Aegis) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	if a.option.Mux {
+		mc, err := a.getMuxPool().GetConn()
+		if err != nil {
+			return nil, fmt.Errorf("aegis mux: get conn (udp): %w", err)
+		}
+		pc, err := mc.OpenPacketConn()
+		if err != nil {
+			return nil, err
+		}
+		return newPacketConn(pc, a), nil
+	}
+
 	c, err := a.dialer.DialContext(ctx, "tcp", a.addr)
 	if err != nil {
 		return nil, fmt.Errorf("aegis udp dial %s: %w", a.addr, err)
@@ -184,6 +223,38 @@ func (a *Aegis) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		return nil, err
 	}
 	return newPacketConn(pc, a), nil
+}
+
+// getMuxPool returns the lazily-created MuxPool. The factory dials a
+// fresh TCP + TLS + Aegis handshake on demand whenever the pool needs
+// a new underlying connection.
+func (a *Aegis) getMuxPool() *aegis.MuxPool {
+	a.muxPoolOnce.Do(func() {
+		a.muxPool = aegis.NewMuxPool(func() (*aegis.MuxConn, error) {
+			ctx := context.Background()
+			c, err := a.dialer.DialContext(ctx, "tcp", a.addr)
+			if err != nil {
+				return nil, fmt.Errorf("aegis mux factory dial %s: %w", a.addr, err)
+			}
+			tlsConn, err := a.handshakeTLS(ctx, c)
+			if err != nil {
+				c.Close()
+				return nil, err
+			}
+			cfg, err := a.buildAegisClientConfig()
+			if err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+			mc, err := aegis.NewMuxConn(tlsConn, cfg)
+			if err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+			return mc, nil
+		})
+	})
+	return a.muxPool
 }
 
 // SupportUOT implements C.ProxyAdapter -- yes, UDP rides UoT frames.

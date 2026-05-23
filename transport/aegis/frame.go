@@ -29,13 +29,25 @@ import (
 type FrameType byte
 
 const (
+	// v1 (single-stream)
 	FrameData         FrameType = 0x01
 	FrameKeepAlive    FrameType = 0x02
 	FrameClose        FrameType = 0x03
 	FrameConnect      FrameType = 0x04
 	FrameConnectAck   FrameType = 0x05
-	FrameUdpAssociate FrameType = 0x06 // empty payload; replaces FrameConnect for UDP-over-TCP
-	FrameUdpData      FrameType = 0x07 // [atyp:1][addr][port:2][udp_payload]
+	FrameUdpAssociate FrameType = 0x06
+	FrameUdpData      FrameType = 0x07
+
+	// v2 (mux: many logical streams per TLS+Aegis conn).
+	// For all Mux* frame types, the FIRST 4 BYTES of payload = stream_id (u32 BE).
+	FrameMuxStreamOpenTcp FrameType = 0x10 // c→s [sid][atyp,addr,port]
+	FrameMuxStreamOpenAck FrameType = 0x11 // s→c [sid][status]
+	FrameMuxStreamData    FrameType = 0x12 // ↔   [sid][bytes]
+	FrameMuxStreamClose   FrameType = 0x13 // ↔   [sid]
+	FrameMuxStreamOpenUdp FrameType = 0x14 // c→s [sid]
+	FrameMuxStreamUdpData FrameType = 0x15 // ↔   [sid][atyp,addr,port][udp_data]
+	FrameMuxKeepAlive     FrameType = 0x16 // (sid=0, empty payload)
+	FrameMuxGoAway        FrameType = 0x17 // (sid=0, empty payload)
 )
 
 const (
@@ -289,4 +301,62 @@ func DecodeUdpData(buf []byte) (string, uint16, []byte, error) {
 	port := binary.BigEndian.Uint16(buf[off : off+2])
 	off += 2
 	return host, port, buf[off:], nil
+}
+
+// ── v2 mux helpers ─────────────────────────────────────────────────────
+
+// IsMux reports whether the frame type belongs to the v2 mux protocol
+// (first 4 bytes of payload = stream_id).
+func (t FrameType) IsMux() bool {
+	switch t {
+	case FrameMuxStreamOpenTcp, FrameMuxStreamOpenAck, FrameMuxStreamData,
+		FrameMuxStreamClose, FrameMuxStreamOpenUdp, FrameMuxStreamUdpData,
+		FrameMuxKeepAlive, FrameMuxGoAway:
+		return true
+	}
+	return false
+}
+
+// MuxPayload builds a mux frame payload: 4-byte stream_id followed by tail.
+func MuxPayload(streamID uint32, tail []byte) []byte {
+	out := make([]byte, 4+len(tail))
+	binary.BigEndian.PutUint32(out[:4], streamID)
+	copy(out[4:], tail)
+	return out
+}
+
+// SplitStreamID pulls a 4-byte stream_id off the front of a mux payload.
+func SplitStreamID(buf []byte) (uint32, []byte, error) {
+	if len(buf) < 4 {
+		return 0, nil, errors.New("aegis: mux frame missing stream_id")
+	}
+	return binary.BigEndian.Uint32(buf[:4]), buf[4:], nil
+}
+
+// EncodeMuxOpenTcp builds an OpenTcp payload: [sid][atyp,addr,port].
+func EncodeMuxOpenTcp(streamID uint32, host string, port uint16) []byte {
+	return MuxPayload(streamID, EncodeConnect(host, port))
+}
+
+// EncodeMuxOpenAck: [sid][status:u8].
+func EncodeMuxOpenAck(streamID uint32, status byte) []byte {
+	out := make([]byte, 5)
+	binary.BigEndian.PutUint32(out[:4], streamID)
+	out[4] = status
+	return out
+}
+
+// EncodeMuxUdpData: [sid][atyp,addr,port][udp_data].
+func EncodeMuxUdpData(streamID uint32, host string, port uint16, data []byte) []byte {
+	return MuxPayload(streamID, EncodeUdpData(host, port, data))
+}
+
+// DecodeMuxUdpData: -> (sid, host, port, data).
+func DecodeMuxUdpData(buf []byte) (uint32, string, uint16, []byte, error) {
+	sid, rest, err := SplitStreamID(buf)
+	if err != nil {
+		return 0, "", 0, nil, err
+	}
+	host, port, data, err := DecodeUdpData(rest)
+	return sid, host, port, data, err
 }
