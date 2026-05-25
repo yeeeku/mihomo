@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	DefaultMuxBufferFrames = 64  // per-stream inbound channel depth
-	DefaultWriterChanDepth = 128 // shared writer queue
-	DefaultOpenAckTimeout  = 10 * time.Second
+	DefaultMuxBufferFrames    = 256             // per-stream inbound channel depth (~2 MB at 8KB frames)
+	DefaultWriterChanDepth    = 256             // shared writer queue
+	DefaultOpenAckTimeout     = 10 * time.Second
+	DefaultMuxKeepAliveEvery  = 30 * time.Second // proactive keepalive to defeat NAT timers
 )
 
 // MuxConn is one TLS+Aegis tunnel carrying many logical streams.
@@ -65,7 +66,25 @@ func NewMuxConn(c net.Conn, cfg ClientConfig) (*MuxConn, error) {
 	}
 	go m.writerLoop()
 	go m.demuxLoop()
+	go m.keepAliveLoop()
 	return m, nil
+}
+
+// keepAliveLoop sends a MuxKeepAlive every DefaultMuxKeepAliveEvery so
+// NAT/firewall middleboxes don't drop the idle TLS conn. Server is
+// responsible for ignoring these frames.
+func (m *MuxConn) keepAliveLoop() {
+	t := time.NewTicker(DefaultMuxKeepAliveEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			// best-effort, ignore errors -- writerLoop will close on real failures
+			_ = m.send(FrameMuxKeepAlive, nil)
+		case <-m.done:
+			return
+		}
+	}
 }
 
 // IsClosed reports whether the underlying conn is dead / shutting down.
@@ -164,12 +183,21 @@ func (m *MuxConn) demuxLoop() {
 				}
 			}
 		case FrameMuxStreamData, FrameMuxStreamUdpData:
-			// Hand rest (minus sid) to the stream's recv channel.
+			// Per-stream HOL guard: never block the demuxer waiting on a
+			// single slow consumer -- that would freeze every other stream
+			// sharing this TLS conn. If a stream's recv buffer overflows,
+			// kill JUST that stream (not the whole conn) and tell the peer.
 			select {
 			case s.recvCh <- rest:
 			case <-s.closed:
 			case <-m.done:
 				return
+			default:
+				s.markClosed(fmt.Errorf("aegis mux: stream %d recv overflow", sid))
+				m.streamMu.Lock()
+				delete(m.streams, sid)
+				m.streamMu.Unlock()
+				_ = m.send(FrameMuxStreamClose, MuxPayload(sid, nil))
 			}
 		case FrameMuxStreamClose:
 			s.markClosed(io.EOF)
@@ -335,10 +363,25 @@ func (s *muxStream) Write(p []byte) (int, error) {
 	if s.isClosed() {
 		return 0, io.ErrClosedPipe
 	}
-	if err := s.conn.send(FrameMuxStreamData, MuxPayload(s.sid, p)); err != nil {
-		return 0, err
+	// Chunk at MaxPayload - 4 (sid header). Without this, a single 32KB write
+	// from io.Copy turns into one oversized frame -> EncodeFrame returns
+	// "payload too large" -> writerLoop kills the entire mux conn (taking
+	// every other stream with it). v1 conn.go has had this loop since day
+	// one; mux.go missed it.
+	const chunkMax = MaxPayload - 4
+	total := 0
+	for len(p) > 0 {
+		n := len(p)
+		if n > chunkMax {
+			n = chunkMax
+		}
+		if err := s.conn.send(FrameMuxStreamData, MuxPayload(s.sid, p[:n])); err != nil {
+			return total, err
+		}
+		total += n
+		p = p[n:]
 	}
-	return len(p), nil
+	return total, nil
 }
 
 func (s *muxStream) Close() error {
@@ -391,6 +434,12 @@ func (p *muxPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 		return 0, err
 	}
 	payload := EncodeMuxUdpData(p.stream.sid, host, port, b)
+	// UDP packets larger than MaxPayload (minus header/sid/atyp/port) cannot
+	// fit in one Aegis frame; UDP semantics also forbid fragmentation here.
+	// Drop oversized datagrams (this matches kernel UDP behaviour for IP MTU).
+	if len(payload) > MaxPayload {
+		return 0, fmt.Errorf("aegis mux: udp payload %d exceeds frame limit", len(b))
+	}
 	if err := p.stream.conn.send(FrameMuxStreamUdpData, payload); err != nil {
 		return 0, err
 	}
